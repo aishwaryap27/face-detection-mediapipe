@@ -2,7 +2,7 @@ import cv2
 import mediapipe as mp
 import math
 import time
-
+import winsound
 def calculate_ear(landmarks, eye_indices):
 
     # Get the 6 eye points
@@ -86,12 +86,15 @@ landmarker_options = mp.tasks.vision.FaceLandmarkerOptions(
 face_landmarker = mp.tasks.vision.FaceLandmarker.create_from_options(
     landmarker_options
 )
-
+eye_closed_start_time = None
+drowsy = False
 cap = cv2.VideoCapture(0)
 yawn_start_time = None
 yawn_count = 0
 blink_count = 0
 eyes_were_closed = False
+yawn_was_detected = False
+drowsiness_alerted = False
 while True:
 
     success, frame = cap.read()
@@ -190,6 +193,29 @@ while True:
             elif eye_status == "OPEN" and eyes_were_closed:
                 blink_count += 1
                 eyes_were_closed = False
+            if eye_status == "CLOSED":
+
+                if eye_closed_start_time is None:
+                    eye_closed_start_time = time.time()
+
+                eye_closed_duration = time.time() - eye_closed_start_time
+
+            else:
+
+                eye_closed_start_time = None
+                eye_closed_duration = 0
+
+                drowsy = False
+                drowsiness_alerted = False
+
+
+            if eye_closed_duration > 2:
+
+                drowsy = True
+
+                if not drowsiness_alerted:
+                    winsound.Beep(1000, 500)
+                    drowsiness_alerted = True
             MAR_THRESHOLD = 0.40
 
             if mar > MAR_THRESHOLD:
@@ -206,7 +232,16 @@ while True:
             else:
                 yawn_start_time = None
                 mouth_open_duration = 0
-            if mouth_open_duration > 1.5:
+                yawn_was_detected = False
+
+
+            if mouth_open_duration > 1.2 and not yawn_was_detected:
+
+                yawn_count += 1
+                yawn_was_detected = True
+
+
+            if yawn_was_detected:
                 yawn_status = "YAWN DETECTED"
             else:
                 yawn_status = "NO YAWN"
@@ -253,6 +288,15 @@ while True:
             cv2.FONT_HERSHEY_SIMPLEX,
             1,
             (255, 0, 255),
+            2
+            )
+            cv2.putText(
+            frame,
+            f"Status: {drowsiness_alerted}",
+            (30, 360),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            1,
+            (0, 0, 255),
             2
             )
             for index in left_eye_indices:
