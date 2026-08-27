@@ -88,19 +88,28 @@ face_landmarker = mp.tasks.vision.FaceLandmarker.create_from_options(
 )
 eye_closed_start_time = None
 drowsy = False
+looking_away_start_time = None
+looking_away_alerted = False
+looking_away_count = 0
 cap = cv2.VideoCapture(0)
+interview_start_time = time.time()
+total_looking_away_time = 0
 yawn_start_time = None
 yawn_count = 0
 blink_count = 0
 eyes_were_closed = False
 yawn_was_detected = False
 drowsiness_alerted = False
+looking_away_duration = 0
+attention_status = "CENTER"
+cv2.namedWindow("AI Interview Analyzer", cv2.WINDOW_NORMAL)
 while True:
 
     success, frame = cap.read()
 
     if not success:
         break
+    frame = cv2.resize(frame, (1280, 720))
 
     # Convert BGR → RGB
     rgb_frame = cv2.cvtColor(
@@ -149,8 +158,77 @@ while True:
     if landmark_result.face_landmarks:
 
         for face_landmarks in landmark_result.face_landmarks:
+            nose = face_landmarks[1]
+            left_cheek = face_landmarks[234]
+            right_cheek = face_landmarks[454]
 
+            face_center_x = (left_cheek.x + right_cheek.x) / 2
+
+            nose_position = nose.x - face_center_x
+
+            if nose_position < -0.05:
+                attention_status = "LOOKING LEFT"
+
+            elif nose_position > 0.05:
+                attention_status = "LOOKING RIGHT"
+
+            else:
+                attention_status = "CENTER"
+            if attention_status != "CENTER":
+
+                if looking_away_start_time is None:
+                    looking_away_start_time = time.time()
+
+                looking_away_duration = time.time() - looking_away_start_time
+
+            else:
+
+                if looking_away_start_time is not None:
+                    total_looking_away_time += time.time() - looking_away_start_time
+
+                looking_away_start_time = None
+                looking_away_duration = 0
+                looking_away_alerted = False
+           
+
+            if looking_away_duration > 2:
+
+                if not looking_away_alerted:
+                    winsound.Beep(800, 500)
+                    looking_away_alerted = True
+                    looking_away_count += 1
             mar = calculate_mar(face_landmarks)
+            interview_duration = time.time() - interview_start_time
+            #interview_duration = time.time() - interview_start_time
+            minutes = int(interview_duration // 60)
+            seconds = int(interview_duration % 60)
+            if interview_duration > 0:
+                attention_percentage = (
+                    (interview_duration - total_looking_away_time)
+                    / interview_duration
+                ) * 100
+            else:
+                attention_percentage = 100
+            attention_percentage = max(0, attention_percentage)
+            cv2.putText(
+                frame,
+                f"Interview Time: {minutes:02d}:{seconds:02d}",
+                (30, 520),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                1,
+                (255, 255, 255),
+                2
+            )
+
+            cv2.putText(
+                frame,
+                f"Attention Score: {attention_percentage:.1f}%",
+                (30, 560),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                1,
+                (0, 255, 255),
+                2
+            )
             cv2.putText(
             frame,
             f"MAR: {mar:.2f}",
@@ -283,12 +361,43 @@ while True:
             )
             cv2.putText(
             frame,
+            f"Attention: {attention_status}",
+            (30, 400),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            1,
+            (255, 255, 255),
+            2
+            )
+
+            cv2.putText(
+            frame,
+            f"Away Time: {looking_away_duration:.1f}s",
+            (30, 440),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            1,
+            (0, 165, 255),
+            2
+            )
+
+            cv2.putText(
+            frame,
+            f"Away Count: {looking_away_count}",
+            (30, 480),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            1,
+            (0, 165, 255),
+            2
+            )
+            cv2.putText(
+            frame,
             f"Mouth: {mouth_status}",
             (30, 240),
             cv2.FONT_HERSHEY_SIMPLEX,
             1,
             (255, 0, 255),
             2
+
+
             )
             cv2.putText(
             frame,
@@ -297,6 +406,15 @@ while True:
             cv2.FONT_HERSHEY_SIMPLEX,
             1,
             (0, 0, 255),
+            2
+            )
+            cv2.putText(
+            frame,
+            f"Attention: {attention_status}",
+            (30, 400),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            1,
+            (255, 255, 255),
             2
             )
             for index in left_eye_indices:
@@ -344,6 +462,8 @@ while True:
     # ==============================
     # DISPLAY
     # ==============================
+
+    cv2.namedWindow("AI Interview Analyzer", cv2.WINDOW_NORMAL)
 
     cv2.imshow(
         "AI Interview Analyzer",
