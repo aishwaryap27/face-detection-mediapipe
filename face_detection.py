@@ -1,488 +1,321 @@
 import cv2
-import mediapipe as mp
+import json
 import math
+import threading
 import time
-import winsound
-def calculate_ear(landmarks, eye_indices):
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-    # Get the 6 eye points
-    p1 = landmarks[eye_indices[0]]
-    p2 = landmarks[eye_indices[1]]
-    p3 = landmarks[eye_indices[2]]
-    p4 = landmarks[eye_indices[3]]
-    p5 = landmarks[eye_indices[4]]
-    p6 = landmarks[eye_indices[5]]
+import mediapipe as mp
 
-    # Vertical distances
-    vertical_1 = math.dist(
-        (p2.x, p2.y),
-        (p6.x, p6.y)
-    )
-
-    vertical_2 = math.dist(
-        (p3.x, p3.y),
-        (p5.x, p5.y)
-    )
-
-    # Horizontal distance
-    horizontal = math.dist(
-        (p1.x, p1.y),
-        (p4.x, p4.y)
-    )
-
-    # Eye Aspect Ratio
-    ear = (vertical_1 + vertical_2) / (2 * horizontal)
-
-    return ear
-def calculate_mar(landmarks):
-
-    left_corner = landmarks[61]
-    right_corner = landmarks[291]
-
-    upper_lip = landmarks[13]
-    lower_lip = landmarks[14]
-
-    vertical = math.dist(
-        (upper_lip.x, upper_lip.y),
-        (lower_lip.x, lower_lip.y)
-    )
-
-    horizontal = math.dist(
-        (left_corner.x, left_corner.y),
-        (right_corner.x, right_corner.y)
-    )
-
-    mar = vertical / horizontal
-
-    return mar
 FACE_DETECTOR_MODEL = "models/blaze_face_short_range.tflite"
 FACE_LANDMARKER_MODEL = "models/face_landmarker.task"
+API_HOST = "127.0.0.1"
+API_PORT = 5000
+
+state_lock = threading.Lock()
+latest_frame = None
+state_version = 0
+stop_event = threading.Event()
+analysis_thread = None
+session_summary = None
+latest_state = {}
 
 
-# ==============================
-# FACE DETECTOR
-# ==============================
+def calculate_ear(landmarks, eye_indices):
+    points = [landmarks[index] for index in eye_indices]
+    vertical_1 = math.dist((points[1].x, points[1].y), (points[5].x, points[5].y))
+    vertical_2 = math.dist((points[2].x, points[2].y), (points[4].x, points[4].y))
+    horizontal = math.dist((points[0].x, points[0].y), (points[3].x, points[3].y))
+    return (vertical_1 + vertical_2) / (2 * horizontal)
 
-face_detector = mp.tasks.vision.FaceDetector.create_from_model_path(
-    FACE_DETECTOR_MODEL
-)
+
+def calculate_mar(landmarks):
+    vertical = math.dist((landmarks[13].x, landmarks[13].y), (landmarks[14].x, landmarks[14].y))
+    horizontal = math.dist((landmarks[61].x, landmarks[61].y), (landmarks[291].x, landmarks[291].y))
+    return vertical / horizontal
 
 
-# ==============================
-# FACE LANDMARKER
-# ==============================
+def publish(values, frame=None):
+    global latest_frame, state_version
+    with state_lock:
+        latest_state.update(values)
+        latest_state["last_updated"] = time.time()
+        latest_frame = frame
+        state_version += 1
 
-BaseOptions = mp.tasks.BaseOptions
-VisionRunningMode = mp.tasks.vision.RunningMode
 
-landmarker_options = mp.tasks.vision.FaceLandmarkerOptions(
-    base_options=BaseOptions(
-        model_asset_path=FACE_LANDMARKER_MODEL
-    ),
-    running_mode=VisionRunningMode.IMAGE,
-    num_faces=1
-)
+def read_state():
+    with state_lock:
+        return dict(latest_state)
 
-face_landmarker = mp.tasks.vision.FaceLandmarker.create_from_options(
-    landmarker_options
-)
-eye_closed_start_time = None
-drowsy = False
-looking_away_start_time = None
-looking_away_alerted = False
-looking_away_count = 0
-cap = cv2.VideoCapture(0)
-interview_start_time = time.time()
-total_looking_away_time = 0
-yawn_start_time = None
-yawn_count = 0
-blink_count = 0
-eyes_were_closed = False
-yawn_was_detected = False
-drowsiness_alerted = False
-looking_away_duration = 0
-attention_status = "CENTER"
-cv2.namedWindow("AI Interview Analyzer", cv2.WINDOW_NORMAL)
-while True:
 
-    success, frame = cap.read()
+def read_frame():
+    with state_lock:
+        return latest_frame
 
-    if not success:
-        break
-    frame = cv2.resize(frame, (1280, 720))
 
-    # Convert BGR → RGB
-    rgb_frame = cv2.cvtColor(
-        frame,
-        cv2.COLOR_BGR2RGB
+def reset_state():
+    global session_summary
+    with state_lock:
+        session_summary = None
+        latest_state.clear()
+        latest_state.update({
+            "camera": "starting", "face_detected": False, "ear": None, "mar": None,
+            "blink_count": 0, "yawn_count": 0, "looking_away_count": 0,
+            "eye_status": None, "mouth_status": None, "yawn_status": None,
+            "drowsiness_status": None, "attention_status": None,
+            "attention_percentage": None, "interview_duration": 0, "last_updated": None,
+        })
+
+
+def finish_session(summary):
+    global session_summary
+    with state_lock:
+        session_summary = summary
+    publish({"camera": "stopped", "face_detected": False})
+
+
+def end_session():
+    stop_event.set()
+    thread = analysis_thread
+    if thread and thread is not threading.current_thread():
+        thread.join(timeout=5)
+    return read_summary()
+
+
+def read_summary():
+    with state_lock:
+        return dict(session_summary) if session_summary else None
+
+
+class AnalyzerHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        if self.path == "/api/analysis":
+            self.send_json(read_state())
+        elif self.path == "/api/summary":
+            self.send_json(read_summary() or {})
+        elif self.path == "/api/stream":
+            self.send_response(200)
+            self.send_header("Content-Type", "text/event-stream")
+            self.send_header("Cache-Control", "no-cache")
+            self.send_header("Access-Control-Allow-Origin", "*")
+            self.end_headers()
+            last_version = -1
+            try:
+                while True:
+                    with state_lock:
+                        version = state_version
+                        state = dict(latest_state)
+                    if version != last_version:
+                        self.wfile.write(f"data: {json.dumps(state)}\n\n".encode())
+                        self.wfile.flush()
+                        last_version = version
+                    if state.get("camera") == "stopped":
+                        break
+                    time.sleep(0.05)
+            except (BrokenPipeError, ConnectionResetError):
+                pass
+        elif self.path == "/video":
+            self.send_response(200)
+            self.send_header("Content-Type", "multipart/x-mixed-replace; boundary=frame")
+            self.send_header("Cache-Control", "no-cache")
+            self.send_header("Access-Control-Allow-Origin", "*")
+            self.end_headers()
+            try:
+                while True:
+                    frame = read_frame()
+                    if frame:
+                        self.wfile.write(b"--frame\r\nContent-Type: image/jpeg\r\n\r\n" + frame + b"\r\n")
+                        self.wfile.flush()
+                    if read_state().get("camera") == "stopped":
+                        break
+                    time.sleep(0.05)
+            except (BrokenPipeError, ConnectionResetError):
+                pass
+        else:
+            self.send_error(404)
+
+    def do_POST(self):
+        if self.path == "/api/end":
+            self.send_json(end_session() or {})
+        elif self.path == "/api/start":
+            start_analysis()
+            self.send_json(read_state())
+        else:
+            self.send_error(404)
+
+    def send_json(self, data):
+        body = json.dumps(data).encode()
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Access-Control-Allow-Origin", "*")
+        self.end_headers()
+        self.wfile.write(body)
+
+    def log_message(self, *_args):
+        return
+
+
+def analysis_loop():
+    global latest_state
+    detector = mp.tasks.vision.FaceDetector.create_from_model_path(FACE_DETECTOR_MODEL)
+    options = mp.tasks.vision.FaceLandmarkerOptions(
+        base_options=mp.tasks.BaseOptions(model_asset_path=FACE_LANDMARKER_MODEL),
+        running_mode=mp.tasks.vision.RunningMode.IMAGE,
+        num_faces=1,
     )
-
-    mp_image = mp.Image(
-        image_format=mp.ImageFormat.SRGB,
-        data=rgb_frame
-    )
-
-
-    
-    detection_result = face_detector.detect(mp_image)
-
-    for detection in detection_result.detections:
-
-        score = detection.categories[0].score
-
-        if score < 0.75:
-            continue
-
-        bbox = detection.bounding_box
-
-        x = bbox.origin_x
-        y = bbox.origin_y
-        width = bbox.width
-        height = bbox.height
-
-        cv2.rectangle(
-            frame,
-            (x, y),
-            (x + width, y + height),
-            (0, 255, 0),
-            2
-        )
-
-
-
-    landmark_result = face_landmarker.detect(mp_image)
-
-
-    
-
-    if landmark_result.face_landmarks:
-
-        for face_landmarks in landmark_result.face_landmarks:
-            nose = face_landmarks[1]
-            left_cheek = face_landmarks[234]
-            right_cheek = face_landmarks[454]
-
-            face_center_x = (left_cheek.x + right_cheek.x) / 2
-
-            nose_position = nose.x - face_center_x
-
-            if nose_position < -0.05:
-                attention_status = "LOOKING LEFT"
-
-            elif nose_position > 0.05:
-                attention_status = "LOOKING RIGHT"
-
-            else:
-                attention_status = "CENTER"
-            if attention_status != "CENTER":
-
-                if looking_away_start_time is None:
-                    looking_away_start_time = time.time()
-
-                looking_away_duration = time.time() - looking_away_start_time
-
-            else:
-
-                if looking_away_start_time is not None:
-                    total_looking_away_time += time.time() - looking_away_start_time
-
-                looking_away_start_time = None
-                looking_away_duration = 0
-                looking_away_alerted = False
-           
-
-            if looking_away_duration > 2:
-
-                if not looking_away_alerted:
-                    winsound.Beep(800, 500)
-                    looking_away_alerted = True
-                    looking_away_count += 1
-            mar = calculate_mar(face_landmarks)
-            interview_duration = time.time() - interview_start_time
-            #interview_duration = time.time() - interview_start_time
-            minutes = int(interview_duration // 60)
-            seconds = int(interview_duration % 60)
-            if interview_duration > 0:
-                attention_percentage = (
-                    (interview_duration - total_looking_away_time)
-                    / interview_duration
-                ) * 100
-            else:
-                attention_percentage = 100
-            attention_percentage = max(0, attention_percentage)
-            cv2.putText(
-                frame,
-                f"Interview Time: {minutes:02d}:{seconds:02d}",
-                (30, 520),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                1,
-                (255, 255, 255),
-                2
-            )
-
-            cv2.putText(
-                frame,
-                f"Attention Score: {attention_percentage:.1f}%",
-                (30, 560),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                1,
-                (0, 255, 255),
-                2
-            )
-            cv2.putText(
-            frame,
-            f"MAR: {mar:.2f}",
-            (30, 200),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            1,
-            (255, 0, 255),
-            2
-            )
-            left_eye_indices = [
-                33, 160, 158, 133, 153, 144
-            ]
-
-            
-            right_eye_indices = [
-                362, 385, 387, 263, 373, 380
-            ]
-            left_ear = calculate_ear(
-            face_landmarks,
-            left_eye_indices
-            )
-
-            right_ear = calculate_ear(
-            face_landmarks,
-            right_eye_indices
-            )
-
-            average_ear = (left_ear + right_ear) / 2
-           # average_ear = (left_ear + right_ear) / 2
-
-            EAR_THRESHOLD = 0.20
-
-            if average_ear < EAR_THRESHOLD:
-                eye_status = "CLOSED"
-            else:
-                eye_status = "OPEN"
-            if eye_status == "CLOSED":
-                eyes_were_closed = True
-
-            elif eye_status == "OPEN" and eyes_were_closed:
-                blink_count += 1
-                eyes_were_closed = False
-            if eye_status == "CLOSED":
-
-                if eye_closed_start_time is None:
-                    eye_closed_start_time = time.time()
-
-                eye_closed_duration = time.time() - eye_closed_start_time
-
-            else:
-
-                eye_closed_start_time = None
-                eye_closed_duration = 0
-
-                drowsy = False
-                drowsiness_alerted = False
-
-
-            if eye_closed_duration > 2:
-
-                drowsy = True
-
-                if not drowsiness_alerted:
-                    winsound.Beep(1000, 500)
-                    drowsiness_alerted = True
-            MAR_THRESHOLD = 0.40
-
-            if mar > MAR_THRESHOLD:
-                mouth_status = "OPEN"
-            else:
-                mouth_status = "CLOSED"
-            if mouth_status == "OPEN":
-
-                if yawn_start_time is None:
-                    yawn_start_time = time.time()
-
-                mouth_open_duration = time.time() - yawn_start_time
-
-            else:
-                yawn_start_time = None
-                mouth_open_duration = 0
-                yawn_was_detected = False
-
-
-            if mouth_open_duration > 1.2 and not yawn_was_detected:
-
-                yawn_count += 1
-                yawn_was_detected = True
-
-
-            if yawn_was_detected:
-                yawn_status = "YAWN DETECTED"
-            else:
-                yawn_status = "NO YAWN"
-            cv2.putText(
-            frame,
-            f"Eye Aspect Ratio: {average_ear:.2f}",
-            (30, 40),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            1,
-            (0, 255, 255),
-            2
-            )
-            cv2.putText(
-            frame,
-            f"Eyes: {eye_status}",
-            (30, 80),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            1,
-            (0, 255, 0),
-            2
-            )
-            cv2.putText(
-            frame,
-            f"Blinks: {blink_count}",
-            (30, 120),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            1,
-            (255, 255, 0),
-            2
-            )
-            cv2.putText(
-            frame,
-            yawn_status,
-            (30, 280),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            1,
-            (0, 0, 255),
-            2
-            )
-            cv2.putText(
-            frame,
-            f"Attention: {attention_status}",
-            (30, 400),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            1,
-            (255, 255, 255),
-            2
-            )
-
-            cv2.putText(
-            frame,
-            f"Away Time: {looking_away_duration:.1f}s",
-            (30, 440),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            1,
-            (0, 165, 255),
-            2
-            )
-
-            cv2.putText(
-            frame,
-            f"Away Count: {looking_away_count}",
-            (30, 480),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            1,
-            (0, 165, 255),
-            2
-            )
-            cv2.putText(
-            frame,
-            f"Mouth: {mouth_status}",
-            (30, 240),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            1,
-            (255, 0, 255),
-            2
-
-
-            )
-            cv2.putText(
-            frame,
-            f"Status: {drowsiness_alerted}",
-            (30, 360),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            1,
-            (0, 0, 255),
-            2
-            )
-            cv2.putText(
-            frame,
-            f"Attention: {attention_status}",
-            (30, 400),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            1,
-            (255, 255, 255),
-            2
-            )
-            for index in left_eye_indices:
-
-                landmark = face_landmarks[index]
-
-                eye_x = int(
-                    landmark.x * frame.shape[1]
-                )
-
-                eye_y = int(
-                    landmark.y * frame.shape[0]
-                )
-
-                cv2.circle(
-                    frame,
-                    (eye_x, eye_y),
-                    3,
-                    (255, 0, 0),
-                    -1
-                )
-
-
-            for index in right_eye_indices:
-
-                landmark = face_landmarks[index]
-
-                eye_x = int(
-                    landmark.x * frame.shape[1]
-                )
-
-                eye_y = int(
-                    landmark.y * frame.shape[0]
-                )
-
-                cv2.circle(
-                    frame,
-                    (eye_x, eye_y),
-                    3,
-                    (255, 0, 0),
-                    -1
-                )
-
-
-    # ==============================
-    # DISPLAY
-    # ==============================
-
-    cv2.namedWindow("AI Interview Analyzer", cv2.WINDOW_NORMAL)
-
-    cv2.imshow(
-        "AI Interview Analyzer",
-        frame
-    )
-
-
-    # Press Q to quit
-    if cv2.waitKey(1) & 0xFF == ord("q"):
-        break
-
-
-# ==============================
-# CLEANUP
-# ==============================
-
-cap.release()
-
-face_detector.close()
-face_landmarker.close()
-
-cv2.destroyAllWindows()
+    landmarker = mp.tasks.vision.FaceLandmarker.create_from_options(options)
+    cap = cv2.VideoCapture(0)
+    start_time = time.time()
+    eye_closed_start = None
+    yawn_start = None
+    eyes_were_closed = False
+    yawn_detected = False
+    drowsiness_active = False
+    closed_eye_time = 0
+    drowsiness_events = 0
+    looking_away_count = 0
+    looking_away_start = None
+    looking_away_alerted = False
+    total_looking_away_time = 0
+    blink_count = 0
+    yawn_count = 0
+    ear_values = []
+    mar_values = []
+    max_mar = None
+    frame_number = 0
+    left_eye = [33, 160, 158, 133, 153, 144]
+    right_eye = [362, 385, 387, 263, 373, 380]
+
+    try:
+        while not stop_event.is_set():
+            success, frame = cap.read()
+            if not success:
+                publish({"camera": "error", "face_detected": False}, None)
+                break
+            frame_number += 1
+            frame = cv2.resize(frame, (1280, 720))
+            image = mp.Image(image_format=mp.ImageFormat.SRGB, data=cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
+            detections = detector.detect(image)
+            for detection in detections.detections:
+                if detection.categories[0].score >= 0.75:
+                    box = detection.bounding_box
+                    cv2.rectangle(frame, (box.origin_x, box.origin_y), (box.origin_x + box.width, box.origin_y + box.height), (0, 255, 0), 2)
+
+            result = landmarker.detect(image)
+            duration = time.time() - start_time
+            values = {
+                "camera": "active", "face_detected": bool(result.face_landmarks), "ear": None, "mar": None,
+                "eye_status": None, "mouth_status": None, "yawn_status": None, "drowsiness_status": None,
+                "attention_status": None, "looking_away_count": looking_away_count,
+                "looking_away_duration": 0, "attention_percentage": None, "interview_duration": duration,
+                "blink_count": blink_count, "yawn_count": yawn_count,
+            }
+            if result.face_landmarks:
+                landmarks = result.face_landmarks[0]
+                nose_position = landmarks[1].x - (landmarks[234].x + landmarks[454].x) / 2
+                attention_status = "LOOKING LEFT" if nose_position < -0.05 else "LOOKING RIGHT" if nose_position > 0.05 else "CENTER"
+                if attention_status != "CENTER":
+                    looking_away_start = looking_away_start or time.time()
+                    looking_away_duration = time.time() - looking_away_start
+                    if looking_away_duration > 2 and not looking_away_alerted:
+                        looking_away_count += 1
+                        looking_away_alerted = True
+                else:
+                    if looking_away_start:
+                        total_looking_away_time += time.time() - looking_away_start
+                    looking_away_start = None
+                    looking_away_duration = 0
+                    looking_away_alerted = False
+                ear = (calculate_ear(landmarks, left_eye) + calculate_ear(landmarks, right_eye)) / 2
+                mar = calculate_mar(landmarks)
+                ear_values.append(ear)
+                mar_values.append(mar)
+                max_mar = mar if max_mar is None else max(max_mar, mar)
+                eye_status = "CLOSED" if ear < 0.20 else "OPEN"
+                mouth_status = "OPEN" if mar > 0.40 else "CLOSED"
+                if eye_status == "CLOSED":
+                    eyes_were_closed = True
+                    eye_closed_start = eye_closed_start or time.time()
+                    if time.time() - eye_closed_start > 2 and not drowsiness_active:
+                        drowsiness_active = True
+                        drowsiness_events += 1
+                else:
+                    if eye_closed_start:
+                        closed_eye_time += time.time() - eye_closed_start
+                    eye_closed_start = None
+                    if eyes_were_closed:
+                        blink_count += 1
+                    eyes_were_closed = False
+                    drowsiness_active = False
+                if mouth_status == "OPEN":
+                    yawn_start = yawn_start or time.time()
+                else:
+                    yawn_start = None
+                    yawn_detected = False
+                if yawn_start and time.time() - yawn_start > 1.2 and not yawn_detected:
+                    yawn_count += 1
+                    yawn_detected = True
+                values.update({
+                    "ear": ear, "mar": mar, "eye_status": eye_status, "mouth_status": mouth_status,
+                    "yawn_status": "YAWN DETECTED" if yawn_detected else "NO YAWN",
+                    "drowsiness_status": "DROWSY" if drowsiness_active else "ALERT",
+                    "attention_status": attention_status, "looking_away_count": looking_away_count,
+                    "looking_away_duration": looking_away_duration,
+                    "attention_percentage": max(0, ((duration - total_looking_away_time) / duration) * 100),
+                    "blink_count": blink_count, "yawn_count": yawn_count,
+                })
+
+            ok, encoded = cv2.imencode(".jpg", frame)
+            publish(values, encoded.tobytes() if ok else None)
+            if frame_number % 30 == 0:
+                print(f"Processed frame {frame_number}: EAR={values['ear']} MAR={values['mar']} blinks={blink_count} yawns={yawn_count}")
+            cv2.imshow("AI Interview Analyzer", frame)
+            if cv2.waitKey(1) & 0xFF == ord("q"):
+                stop_event.set()
+    finally:
+        if eye_closed_start:
+            closed_eye_time += time.time() - eye_closed_start
+        end_time = time.time()
+        duration = end_time - start_time
+        summary = {
+            "call_start_time": start_time, "call_end_time": end_time, "call_duration": duration,
+            "total_blinks": blink_count, "total_yawns": yawn_count,
+            "average_ear": sum(ear_values) / len(ear_values) if ear_values else None,
+            "average_mar": sum(mar_values) / len(mar_values) if mar_values else None,
+            "maximum_mar": max_mar, "drowsiness_events": drowsiness_events,
+            "total_eyes_closed_time": closed_eye_time,
+            "overall_eye_status": "CLOSED" if eyes_were_closed else "OPEN",
+            "overall_drowsiness_status": "DROWSY" if drowsiness_events else "ALERT",
+        }
+        finish_session(summary)
+        cap.release()
+        detector.close()
+        landmarker.close()
+        cv2.destroyAllWindows()
+
+
+def start_analysis():
+    global analysis_thread
+    if analysis_thread and analysis_thread.is_alive():
+        return
+    reset_state()
+    stop_event.clear()
+    analysis_thread = threading.Thread(target=analysis_loop, daemon=True)
+    analysis_thread.start()
+
+
+def main():
+    server = ThreadingHTTPServer((API_HOST, API_PORT), AnalyzerHandler)
+    start_analysis()
+    print(f"Live analysis API: http://{API_HOST}:{API_PORT}")
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
+        end_session()
+        server.shutdown()
+
+
+if __name__ == "__main__":
+    main()
